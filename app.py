@@ -1,5 +1,5 @@
 """
-YouTube Video -> PPT Maker  (Gemini + Streamlit)
+YouTube Lecture to PPT  (Gemini + Streamlit)
 Features: language, detail level, colour theme, screenshots, history, quiz.
 """
 import json
@@ -19,26 +19,38 @@ from youtube_transcript_api import YouTubeTranscriptApi
 
 from pptx_builder import THEMES, build_pptx
 
-st.set_page_config(page_title="YouTube → PPT Maker", page_icon="📚", layout="centered")
+st.set_page_config(page_title="Lecture to PPT", page_icon="📚", layout="centered")
 
-DEFAULT_MODEL = "gemini-2.5-flash"   # free tier par chalta hai
-CHUNK_CHARS = 9000                   # ~10 minute ka transcript ek hissa
-MAX_TRANSCRIPT_CHARS = 150000        # bohat lambi video se bachne ke liye
-MAX_SHOTS = 20                       # zyada se zyada kitne screenshots
-MAX_VIDEO_SECONDS = 2 * 60 * 60      # 2 ghante se lambi video par screenshots nahi
-BUCKET = "ppts"                      # Supabase storage bucket ka naam
+# Hide the Streamlit toolbar (GitHub icon, menu) for a cleaner public site
+st.markdown(
+    """
+    <style>
+    [data-testid="stToolbar"], [data-testid="stDecoration"], #MainMenu, footer {display: none !important;}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+DEFAULT_MODEL = "gemini-2.5-flash"                 # works on the free tier
+FALLBACK_MODELS = ["gemini-2.5-flash-lite"]        # tried automatically if the first one fails
+CHUNK_CHARS = 9000                                 # roughly 10 minutes of lecture per part
+MAX_TRANSCRIPT_CHARS = 150000                      # cost / limit protection for very long videos
+MAX_SHOTS = 20                                     # maximum screenshots per deck
+MAX_VIDEO_SECONDS = 2 * 60 * 60                    # no screenshots for videos longer than 2 hours
+BUCKET = "ppts"                                    # Supabase storage bucket name
 PKT = timezone(timedelta(hours=5))
+MIME = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
 
 LANGS = {
     "English": "English",
-    "Urdu (اردو script)": "Urdu (written in Urdu/Arabic script)",
+    "Urdu (اردو)": "Urdu (written in Urdu/Arabic script)",
     "Roman Urdu": "Roman Urdu (Urdu written in English letters)",
-    "Video wali language": "the same language as the transcript",
+    "Same as the video": "the same language as the transcript",
 }
 DETAIL = {
-    "Mukhtasar (kam slides)": "3-4",
-    "Darmiyana": "5-7",
-    "Tafseeli (zyada detail)": "8-10",
+    "Brief (fewer slides)": "3-4",
+    "Standard": "5-7",
+    "Detailed (more slides)": "8-10",
 }
 
 
@@ -49,6 +61,24 @@ def get_secret(name, default=None):
     except Exception:
         pass
     return os.environ.get(name, default)
+
+
+def explain_error(e) -> str:
+    """Turn a technical error into a clear message for the user."""
+    m = str(e)
+    low = m.lower()
+    if "api_key_invalid" in low or "api key not valid" in low or "permission_denied" in low or "unauthenticated" in low:
+        return "The AI service rejected the API key. Check GEMINI_API_KEY in the app's Secrets."
+    if "429" in m or "resource_exhausted" in low or "quota" in low:
+        return ("The free AI usage limit has been reached. Please wait a minute and try again, "
+                "or try a shorter video / lower detail level.")
+    if "404" in m or "not_found" in low:
+        return "The selected AI model is not available. Set GEMINI_MODEL in Secrets (for example gemini-2.5-flash-lite)."
+    if "503" in m or "unavailable" in low or "overloaded" in low:
+        return "The AI service is busy right now. Please try again in a minute."
+    if "valid json" in low or "format" in low:
+        return "The AI returned an unexpected format. Please try again."
+    return "Something went wrong while generating the slides. Please try again."
 
 
 # ----------------------------------------------------------------------
@@ -76,7 +106,7 @@ def get_video_info(video_id: str):
 
 
 def get_transcript(video_id: str):
-    """[(start_seconds, duration_seconds, text), ...] return karta hai."""
+    """Returns [(start_seconds, duration_seconds, text), ...]."""
     proxy = get_secret("PROXY_URL")
     if proxy:
         from youtube_transcript_api.proxies import GenericProxyConfig
@@ -126,26 +156,33 @@ def split_chunks(snips, size=CHUNK_CHARS, max_chars=MAX_TRANSCRIPT_CHARS):
 # Gemini AI
 # ----------------------------------------------------------------------
 def ask_ai(client, model, system, user, max_tokens=4000):
+    """Calls Gemini. Retries on rate limits and falls back to a second model if needed."""
+    models = [model] + [m for m in FALLBACK_MODELS if m != model]
     last_err = None
-    for attempt in range(4):
-        try:
-            r = client.models.generate_content(
-                model=model,
-                contents=user,
-                config=types.GenerateContentConfig(
-                    system_instruction=system,
-                    max_output_tokens=max_tokens + 4000,
-                    response_mime_type="application/json",
-                ),
-            )
-            return r.text or ""
-        except Exception as e:
-            last_err = e
-            msg = str(e)
-            if any(k in msg for k in ("429", "RESOURCE_EXHAUSTED", "503", "UNAVAILABLE")):
-                time.sleep(20 * (attempt + 1))  # free limit: thoda intezar
-                continue
-            raise
+    for mdl in models:
+        for attempt in range(2):
+            try:
+                r = client.models.generate_content(
+                    model=mdl,
+                    contents=user,
+                    config=types.GenerateContentConfig(
+                        system_instruction=system,
+                        max_output_tokens=max_tokens + 4000,
+                        response_mime_type="application/json",
+                    ),
+                )
+                return r.text or ""
+            except Exception as e:
+                last_err = e
+                msg = str(e)
+                if "404" in msg or "NOT_FOUND" in msg:
+                    break  # model missing -> try the next model
+                if any(k in msg for k in ("429", "RESOURCE_EXHAUSTED", "503", "UNAVAILABLE")):
+                    if attempt == 0:
+                        time.sleep(20)  # free tier: wait a little, then retry once
+                        continue
+                    break  # still limited -> try the next model
+                raise
     raise last_err
 
 
@@ -155,7 +192,7 @@ def parse_json(raw: str):
     raw = re.sub(r"```$", "", raw).strip()
     a, b = raw.find("{"), raw.rfind("}")
     if a == -1 or b == -1:
-        raise ValueError("JSON nahi mila")
+        raise ValueError("No JSON found")
     return json.loads(raw[a : b + 1])
 
 
@@ -165,8 +202,8 @@ def ask_json(client, model, system, user, max_tokens=4000):
         try:
             return parse_json(raw)
         except Exception:
-            user += "\n\nPichla jawab valid JSON nahi tha. Sirf valid JSON return karo."
-    raise ValueError("AI ne sahi format mein jawab nahi diya. Dobara try karo.")
+            user += "\n\nYour previous answer was not valid JSON. Return only valid JSON."
+    raise ValueError("The AI did not return a valid JSON format.")
 
 
 def slides_from_chunk(client, model, chunk, idx, total, lang, per_chunk, done_headings):
@@ -206,8 +243,8 @@ Give 5 quiz questions with short answers."""
 # Screenshots
 # ----------------------------------------------------------------------
 def grab_frames(video_id, times):
-    """Video ke di hue waqt (seconds) par frame nikalta hai. {position: jpg_bytes} return karta hai.
-    yt-dlp se seedha stream ka link leta hai aur ffmpeg se sirf zaroori frame uthata hai."""
+    """Grabs one frame at each given time (seconds). Returns {position: jpg_bytes}.
+    Uses yt-dlp to get the stream URL and ffmpeg to pull only the needed frames."""
     from yt_dlp import YoutubeDL
 
     opts = {
@@ -245,7 +282,7 @@ def grab_frames(video_id, times):
 
 
 def youtube_thumbnails(video_id):
-    """Backup: YouTube ke khud ke 3 frames (takreeban 25%, 50%, 75% par)."""
+    """Backup: YouTube's own 3 preview frames (about 25%, 50%, 75% into the video)."""
     out = []
     for name in ("hq1.jpg", "hq2.jpg", "hq3.jpg"):
         try:
@@ -258,8 +295,8 @@ def youtube_thumbnails(video_id):
     return out
 
 
-def attach_screenshots(video_id, slides, progress):
-    """slides mein 'image' key lagata hai. Message return karta hai."""
+def attach_screenshots(video_id, slides):
+    """Adds an 'image' key to slides. Returns a status message."""
     n = len(slides)
     if n == 0:
         return ""
@@ -276,25 +313,21 @@ def attach_screenshots(video_id, slides, progress):
     if frames:
         for pos, data in frames.items():
             slides[idxs[pos]]["image"] = data
-        return f"{len(frames)} slides par video ke screenshots lag gaye."
+        return f"Video screenshots were added to {len(frames)} slides."
 
-    # backup
     thumbs = youtube_thumbnails(video_id)
     if thumbs:
         spots = [round(n * f) for f in (0.25, 0.5, 0.75)]
         for k, data in enumerate(thumbs):
             slides[min(spots[k], n - 1)]["image"] = data
-        return ("Video se frames nahi nikal sake (server par YouTube ne rok diya hoga). "
-                f"Is liye YouTube ki apni {len(thumbs)} tasveeren lagayi gayi hain.")
-    return "Screenshots nahi mil sake, PPT bina screenshots ke bani hai."
+        return ("Frames could not be taken from the video (YouTube blocked the server), "
+                f"so {len(thumbs)} YouTube preview images were used instead.")
+    return "Screenshots were not available, so the presentation was created without them."
 
 
 # ----------------------------------------------------------------------
-# History (Supabase ho to hamesha ke liye, warna sirf is session mein)
+# History (permanent with Supabase, otherwise this browser session only)
 # ----------------------------------------------------------------------
-MIME = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
-
-
 @st.cache_resource
 def get_store():
     url, key = get_secret("SUPABASE_URL"), get_secret("SUPABASE_KEY")
@@ -316,7 +349,7 @@ def save_history(title, data):
             )
             return ""
         except Exception as e:
-            return f"History mein save nahi ho saki: {str(e)[:200]}"
+            return f"Could not save to history: {str(e)[:200]}"
     st.session_state.setdefault("history", []).insert(0, {"name": name, "data": data})
     return ""
 
@@ -345,16 +378,15 @@ def pretty(name):
 
 
 def show_history():
-    with st.expander("📂 Purani PPTs (History)"):
+    with st.expander("📂 Previous presentations"):
         items = list_history()
         if items is None:
-            st.warning("History load nahi ho saki. Supabase ki settings check karo.")
+            st.warning("History could not be loaded. Please check the storage settings.")
             return
         if not get_store():
-            st.caption("Abhi history sirf is browser session tak hai. Hamesha ke liye rakhne ke liye "
-                       "README mein Supabase wala step karo.")
+            st.caption("History is currently kept only for this browser session.")
         if not items:
-            st.write("Abhi koi PPT nahi bani.")
+            st.write("No presentations yet.")
         for it in items:
             st.write(pretty(it["name"]))
             data = it["data"]
@@ -362,12 +394,12 @@ def show_history():
             if data is None:
                 data = st.session_state.get(key)
                 if data is None:
-                    if st.button("Download ke liye tayyar karo", key="btn::" + it["name"]):
+                    if st.button("Prepare download", key="btn::" + it["name"]):
                         try:
                             st.session_state[key] = get_store().storage.from_(BUCKET).download(it["name"])
                             st.rerun()
                         except Exception as e:
-                            st.error(f"File nahi mili: {str(e)[:150]}")
+                            st.error(f"File not found: {str(e)[:150]}")
                     continue
             st.download_button("⬇️ Download", data, file_name=it["name"].split("__", 1)[-1],
                                mime=MIME, key="dlb::" + it["name"])
@@ -386,35 +418,37 @@ def password_gate():
             st.session_state["authed"] = True
             st.rerun()
         else:
-            st.error("Password ghalat hai.")
+            st.error("Incorrect password.")
     return False
 
 
 def main():
-    st.title("📚 YouTube → PPT Maker")
-    st.caption("YouTube lecture ka link paste karo, detailed PPT download karo.")
+    st.title("📚 Lecture to PPT")
+    st.caption("Paste a YouTube lecture link and get a detailed, ready-to-use presentation.")
 
     if not password_gate():
         st.stop()
 
     api_key = get_secret("GEMINI_API_KEY")
     if not api_key:
-        st.error("GEMINI_API_KEY set nahi hai. README mein 'Secrets' wala step dekho.")
+        st.error("The app is not configured yet: GEMINI_API_KEY is missing in Secrets.")
         st.stop()
 
-    url = st.text_input("YouTube video ka link", placeholder="https://www.youtube.com/watch?v=...")
+    url = st.text_input("YouTube video link", placeholder="https://www.youtube.com/watch?v=...")
     c1, c2 = st.columns(2)
-    lang_label = c1.selectbox("Slides ki language", list(LANGS.keys()))
+    lang_label = c1.selectbox("Slide language", list(LANGS.keys()))
     detail_label = c2.selectbox("Detail level", list(DETAIL.keys()), index=1)
     c3, c4 = st.columns(2)
-    theme_name = c3.selectbox("Theme / colour", list(THEMES.keys()))
-    want_shots = c4.checkbox("Video ke screenshots slides mein lagao", value=False,
-                             help="Slow hai aur server par kabhi kabhi nahi chalta. Na chale to YouTube ki 3 tasveeren lagti hain.")
+    theme_name = c3.selectbox("Theme", list(THEMES.keys()))
+    want_shots = c4.checkbox(
+        "Add video screenshots to slides", value=False,
+        help="Slower, and may not work on every server. If it fails, YouTube preview images are used.",
+    )
 
-    if st.button("PPT banao", type="primary") and url:
+    if st.button("Create presentation", type="primary") and url:
         vid = extract_video_id(url)
         if not vid:
-            st.error("Ye YouTube link sahi nahi lag raha. Dobara check karo.")
+            st.error("This does not look like a valid YouTube link. Please check it and try again.")
             st.stop()
 
         lang = LANGS[lang_label]
@@ -422,53 +456,55 @@ def main():
         per_chunk = DETAIL[detail_label]
         model = get_secret("GEMINI_MODEL", DEFAULT_MODEL)
         client = genai.Client(api_key=api_key)
-        progress = st.progress(0, text="Video ki info la rahe hain...")
+        progress = st.progress(0, text="Fetching video details...")
         st.session_state.pop("shot_msg", None)
 
         try:
             video_title, channel = get_video_info(vid)
 
-            progress.progress(5, text="Transcript nikal rahe hain...")
+            progress.progress(5, text="Getting the transcript...")
             try:
                 snips = get_transcript(vid)
             except Exception as e:
-                st.error("Is video ka transcript nahi mil saka. Ho sakta hai captions band hon, "
-                         "ya YouTube ne server ko block kiya ho.")
-                with st.expander("Technical detail"):
+                progress.empty()
+                st.error("The transcript for this video could not be retrieved. Captions may be turned off, "
+                         "or YouTube may be blocking the server.")
+                with st.expander("Technical details"):
                     st.code(str(e)[:1500])
                 st.stop()
 
             if sum(len(s[2]) for s in snips) < 200:
-                st.error("Transcript bohat chhota hai, isse PPT nahi ban sakti.")
+                progress.empty()
+                st.error("The transcript is too short to create a presentation.")
                 st.stop()
 
             chunks, truncated = split_chunks(snips)
             if truncated:
-                st.warning("Video bohat lambi hai, sirf shuru ka hissa use ho raha hai.")
+                st.warning("This video is very long, so only the first part is used.")
             video_end = chunks[-1]["end"] if chunks else 0
 
             all_slides, headings = [], []
             for i, ch in enumerate(chunks, 1):
                 progress.progress(10 + int(65 * (i - 1) / len(chunks)),
-                                  text=f"AI slides bana raha hai... (hissa {i}/{len(chunks)})")
+                                  text=f"Creating slides... (part {i} of {len(chunks)})")
                 part = slides_from_chunk(client, model, ch["text"], i, len(chunks), lang, per_chunk, headings)
                 for j, sl in enumerate(part):
                     sl["time"] = ch["start"] + (j + 0.5) / len(part) * (ch["end"] - ch["start"])
                 all_slides.extend(part)
                 headings.extend(s.get("heading", "") for s in part)
 
-            progress.progress(78, text="Summary aur quiz bana rahe hain...")
+            progress.progress(78, text="Creating summary and quiz...")
             extra = summary_and_quiz(client, model, all_slides, lang, video_title)
 
             shot_msg = ""
             if want_shots:
                 if video_end > MAX_VIDEO_SECONDS:
-                    shot_msg = "Video 2 ghante se lambi hai, isliye screenshots nahi lagaye."
+                    shot_msg = "The video is longer than 2 hours, so screenshots were skipped."
                 else:
-                    progress.progress(82, text="Video ke screenshots nikal rahe hain (thoda waqt lagega)...")
-                    shot_msg = attach_screenshots(vid, all_slides, progress)
+                    progress.progress(82, text="Capturing video screenshots (this takes a while)...")
+                    shot_msg = attach_screenshots(vid, all_slides)
 
-            progress.progress(95, text="PPT file bana rahe hain...")
+            progress.progress(95, text="Building the PowerPoint file...")
             title = extra.get("title") or video_title or "Lecture"
             data = build_pptx(title, channel, f"https://www.youtube.com/watch?v={vid}",
                               all_slides, extra.get("summary", []), extra.get("quiz", []),
@@ -479,24 +515,25 @@ def main():
             st.session_state["shot_msg"] = shot_msg
             if hist_err:
                 st.warning(hist_err)
-            progress.progress(100, text="Ho gaya!")
+            progress.progress(100, text="Done!")
         except Exception as e:
-            st.error("Kuch masla aa gaya. Dobara try karo.")
-            with st.expander("Technical detail"):
-                st.code(str(e)[:1500])
+            progress.empty()
+            st.error(explain_error(e))
+            with st.expander("Technical details"):
+                st.code(f"{type(e).__name__}: {str(e)[:1500]}")
 
     res = st.session_state.get("result")
     if res:
-        st.success(f"PPT tayyar hai: {res['count']} content slides (+ summary aur quiz)")
+        st.success(f"Your presentation is ready: {res['count']} content slides plus summary and quiz.")
         if st.session_state.get("shot_msg"):
             st.info(st.session_state["shot_msg"])
         safe = re.sub(r"[^\w\- ]", "", res["title"]).strip()[:60] or "lecture"
-        st.download_button("⬇️ PPT download karo", res["data"], file_name=f"{safe}.pptx", mime=MIME)
-        st.info("Class mein dikhane se pehle slides ek baar parh lein. Speaker notes mein poori detail hai.")
+        st.download_button("⬇️ Download PPT", res["data"], file_name=f"{safe}.pptx", mime=MIME)
+        st.info("Please review the slides before presenting. The speaker notes contain the full explanation.")
 
     show_history()
     st.divider()
-    st.caption("Tip: PPT mein channel ka credit shamil hota hai. Kisi aur ka content apne naam se share na karein.")
+    st.caption("The presentation credits the original channel. Please do not share someone else's content as your own.")
 
 
 main()
