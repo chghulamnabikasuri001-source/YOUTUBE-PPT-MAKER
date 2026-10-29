@@ -105,8 +105,8 @@ def get_video_info(video_id: str):
         return "", ""
 
 
-def get_transcript(video_id: str):
-    """Returns [(start_seconds, duration_seconds, text), ...]."""
+def transcript_via_api(video_id: str):
+    """Main method: youtube-transcript-api. Returns [(start, duration, text), ...]."""
     proxy = get_secret("PROXY_URL")
     if proxy:
         from youtube_transcript_api.proxies import GenericProxyConfig
@@ -125,6 +125,80 @@ def get_transcript(video_id: str):
         if txt:
             out.append((float(s.start), float(s.duration), txt))
     return out
+
+
+def transcript_via_ytdlp(video_id: str):
+    """Backup method: read the caption track through yt-dlp."""
+    from yt_dlp import YoutubeDL
+
+    opts = {"quiet": True, "no_warnings": True, "skip_download": True, "socket_timeout": 20}
+    proxy = get_secret("PROXY_URL")
+    if proxy:
+        opts["proxy"] = proxy
+    with YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+    for source in (info.get("subtitles") or {}, info.get("automatic_captions") or {}):
+        for lang in ("ur", "hi", "en"):
+            for key in [k for k in source if k == lang or k.startswith(lang + "-")]:
+                for fmt in source[key]:
+                    if fmt.get("ext") != "json3":
+                        continue
+                    with urllib.request.urlopen(fmt["url"], timeout=20) as r:
+                        data = json.loads(r.read().decode("utf-8"))
+                    out = []
+                    for ev in data.get("events", []):
+                        txt = "".join(sg.get("utf8", "") for sg in (ev.get("segs") or []))
+                        txt = re.sub(r"\s+", " ", txt.replace("\n", " ")).strip()
+                        if txt:
+                            out.append((ev.get("tStartMs", 0) / 1000, ev.get("dDurationMs", 0) / 1000, txt))
+                    if out:
+                        return out
+    raise RuntimeError("No caption track found")
+
+
+def get_transcript(video_id: str):
+    try:
+        return transcript_via_api(video_id)
+    except Exception as first_error:
+        try:
+            return transcript_via_ytdlp(video_id)
+        except Exception:
+            raise first_error
+
+
+def transcript_error_message(e) -> str:
+    name = type(e).__name__
+    if name in ("TranscriptsDisabled", "NoTranscriptFound"):
+        return ("This video has no captions, so a transcript is not available. "
+                "Try another video, or paste the transcript manually.")
+    if name in ("VideoUnavailable", "VideoUnplayable", "InvalidVideoId"):
+        return "This video is unavailable or private."
+    if name in ("IpBlocked", "RequestBlocked", "YouTubeRequestFailed", "AgeRestricted"):
+        return ("YouTube is temporarily blocking requests from this server. "
+                "Please try again later, or paste the transcript manually below.")
+    return ("The transcript for this video could not be retrieved. YouTube may be blocking the server. "
+            "Please try again later, or paste the transcript manually.")
+
+
+def parse_manual_transcript(text: str):
+    """Parses text copied from YouTube's 'Show transcript' panel.
+    Returns (snippets, has_timestamps)."""
+    ts = re.compile(r"^(?:(\d{1,2}):)?(\d{1,2}):(\d{2})$")
+    snips, cur_time, has_ts, n = [], 0.0, False, 0
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        m = ts.match(line)
+        if m:
+            h, mi, sec = int(m.group(1) or 0), int(m.group(2)), int(m.group(3))
+            cur_time, has_ts = h * 3600 + mi * 60 + sec, True
+            continue
+        if not has_ts:
+            cur_time = n * 5.0  # no timestamps: rough placeholder times
+        snips.append((float(cur_time), 5.0, line))
+        n += 1
+    return snips, has_ts
 
 
 def split_chunks(snips, size=CHUNK_CHARS, max_chars=MAX_TRANSCRIPT_CHARS):
@@ -435,6 +509,10 @@ def main():
         st.stop()
 
     url = st.text_input("YouTube video link", placeholder="https://www.youtube.com/watch?v=...")
+    with st.expander("Having trouble with a video? Paste the transcript instead"):
+        manual = st.text_area("Transcript (optional)", height=150, key="manual_transcript")
+        st.caption("On YouTube: open the video, expand the description, click \"Show transcript\", "
+                   "select all the text and copy it here. Timestamps are supported.")
     c1, c2 = st.columns(2)
     lang_label = c1.selectbox("Slide language", list(LANGS.keys()))
     detail_label = c2.selectbox("Detail level", list(DETAIL.keys()), index=1)
@@ -463,15 +541,20 @@ def main():
             video_title, channel = get_video_info(vid)
 
             progress.progress(5, text="Getting the transcript...")
-            try:
-                snips = get_transcript(vid)
-            except Exception as e:
-                progress.empty()
-                st.error("The transcript for this video could not be retrieved. Captions may be turned off, "
-                         "or YouTube may be blocking the server.")
-                with st.expander("Technical details"):
-                    st.code(str(e)[:1500])
-                st.stop()
+            manual_text = (manual or "").strip()
+            if len(manual_text) >= 200:
+                snips, has_ts = parse_manual_transcript(manual_text)
+                if not has_ts:
+                    want_shots = False  # screenshots need real timestamps
+            else:
+                try:
+                    snips = get_transcript(vid)
+                except Exception as e:
+                    progress.empty()
+                    st.error(transcript_error_message(e))
+                    with st.expander("Technical details"):
+                        st.code(f"{type(e).__name__}: {str(e)[:1500]}")
+                    st.stop()
 
             if sum(len(s[2]) for s in snips) < 200:
                 progress.empty()
