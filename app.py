@@ -35,6 +35,7 @@ DEFAULT_MODEL = "gemini-2.5-flash"                 # works on the free tier
 FALLBACK_MODELS = ["gemini-2.5-flash-lite"]        # tried automatically if the first one fails
 CHUNK_CHARS = 9000                                 # roughly 10 minutes of lecture per part
 MAX_TRANSCRIPT_CHARS = 150000                      # cost / limit protection for very long videos
+SEGMENT_SECONDS = 600                              # video mode: 10 minutes per AI call
 MAX_SHOTS = 20                                     # maximum screenshots per deck
 MAX_VIDEO_SECONDS = 2 * 60 * 60                    # no screenshots for videos longer than 2 hours
 BUCKET = "ppts"                                    # Supabase storage bucket name
@@ -76,6 +77,8 @@ def explain_error(e) -> str:
         return "The selected AI model is not available. Set GEMINI_MODEL in Secrets (for example gemini-2.5-flash-lite)."
     if "503" in m or "unavailable" in low or "overloaded" in low:
         return "The AI service is busy right now. Please try again in a minute."
+    if "invalid_argument" in low and ("video" in low or "youtube" in low or "url" in low):
+        return "The AI could not access this video. It must be a public YouTube video (not private or age-restricted)."
     if "valid json" in low or "format" in low:
         return "The AI returned an unexpected format. Please try again."
     return "Something went wrong while generating the slides. Please try again."
@@ -270,9 +273,10 @@ def parse_json(raw: str):
     return json.loads(raw[a : b + 1])
 
 
-def ask_json(client, model, system, user, max_tokens=4000):
+def ask_json(client, model, system, user, max_tokens=4000, video=None):
     for _ in range(2):
-        raw = ask_ai(client, model, system, user, max_tokens)
+        contents = [video, user] if video is not None else user
+        raw = ask_ai(client, model, system, contents, max_tokens)
         try:
             return parse_json(raw)
         except Exception:
@@ -299,6 +303,55 @@ Headings already made in earlier parts (do not repeat them): {done_headings[-15:
 TRANSCRIPT PART:
 {chunk}"""
     return ask_json(client, model, system, user, max_tokens=6000).get("slides", [])
+
+
+def get_video_duration(video_id):
+    """Video length in seconds, or None if it cannot be found."""
+    try:
+        req = urllib.request.Request(
+            f"https://www.youtube.com/watch?v={video_id}",
+            headers={"User-Agent": "Mozilla/5.0", "Accept-Language": "en-US,en;q=0.9"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as r:
+            html = r.read().decode("utf-8", "ignore")
+        m = re.search(r'"lengthSeconds":"(\d+)"', html)
+        if m:
+            return int(m.group(1))
+    except Exception:
+        pass
+    try:
+        from yt_dlp import YoutubeDL
+
+        with YoutubeDL({"quiet": True, "no_warnings": True, "skip_download": True, "socket_timeout": 15}) as ydl:
+            info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+        return int(info.get("duration") or 0) or None
+    except Exception:
+        return None
+
+
+def slides_from_video(client, model, video_id, start, end, idx, lang, per_chunk, done_headings):
+    """Video mode: Gemini watches one segment of the public YouTube video directly."""
+    system = f"""You are an expert teacher's assistant. You are given one segment of a lecture video
+(its audio and visuals). Turn what the teacher says AND any text, formulas or diagrams shown on screen
+into detailed presentation slides for a classroom.
+
+Rules:
+- Cover EVERY concept, definition, example, formula, step and important point in this segment.
+- Do not invent facts that are not in the video.
+- Output language: {lang}.
+- Make about {per_chunk} slides for this segment.
+- Each slide: a short heading, 3-6 bullets (each bullet a complete, useful line), and speaker "notes" (3-6 sentences with the full explanation for the teacher).
+- Skip greetings, subscribe requests, and ads.
+- If this segment has no lecture content, return {{"slides": []}}.
+- Return ONLY valid JSON, no extra text, in this exact shape:
+{{"slides": [{{"heading": "...", "bullets": ["...", "..."], "notes": "..."}}]}}"""
+    user = f"""This is segment {idx} of the lecture ({start // 60} to {end // 60} minutes).
+Headings already made in earlier segments (do not repeat them): {done_headings[-15:]}"""
+    video = types.Part(
+        file_data=types.FileData(file_uri=f"https://www.youtube.com/watch?v={video_id}"),
+        video_metadata=types.VideoMetadata(start_offset=f"{int(start)}s", end_offset=f"{int(end)}s"),
+    )
+    return ask_json(client, model, system, user, max_tokens=6000, video=video).get("slides", [])
 
 
 def summary_and_quiz(client, model, slides, lang, video_title):
@@ -536,12 +589,14 @@ def main():
         client = genai.Client(api_key=api_key)
         progress = st.progress(0, text="Fetching video details...")
         st.session_state.pop("shot_msg", None)
+        st.session_state.pop("mode_note", None)
 
         try:
             video_title, channel = get_video_info(vid)
 
             progress.progress(5, text="Getting the transcript...")
             manual_text = (manual or "").strip()
+            snips, mode, mode_note = None, "transcript", ""
             if len(manual_text) >= 200:
                 snips, has_ts = parse_manual_transcript(manual_text)
                 if not has_ts:
@@ -550,31 +605,63 @@ def main():
                 try:
                     snips = get_transcript(vid)
                 except Exception as e:
+                    if type(e).__name__ in ("VideoUnavailable", "VideoUnplayable", "InvalidVideoId"):
+                        progress.empty()
+                        st.error(transcript_error_message(e))
+                        st.stop()
+                    # Transcript blocked or missing -> let Gemini watch the video directly
+                    mode = "video"
+                    mode_note = ("The transcript could not be retrieved, so the AI analysed the video directly "
+                                 "instead. This is slower for long videos.")
+
+            all_slides, headings, video_end = [], [], 0
+
+            if mode == "transcript":
+                if sum(len(x[2]) for x in snips) < 200:
                     progress.empty()
-                    st.error(transcript_error_message(e))
-                    with st.expander("Technical details"):
-                        st.code(f"{type(e).__name__}: {str(e)[:1500]}")
+                    st.error("The transcript is too short to create a presentation.")
                     st.stop()
-
-            if sum(len(s[2]) for s in snips) < 200:
-                progress.empty()
-                st.error("The transcript is too short to create a presentation.")
-                st.stop()
-
-            chunks, truncated = split_chunks(snips)
-            if truncated:
-                st.warning("This video is very long, so only the first part is used.")
-            video_end = chunks[-1]["end"] if chunks else 0
-
-            all_slides, headings = [], []
-            for i, ch in enumerate(chunks, 1):
-                progress.progress(10 + int(65 * (i - 1) / len(chunks)),
-                                  text=f"Creating slides... (part {i} of {len(chunks)})")
-                part = slides_from_chunk(client, model, ch["text"], i, len(chunks), lang, per_chunk, headings)
-                for j, sl in enumerate(part):
-                    sl["time"] = ch["start"] + (j + 0.5) / len(part) * (ch["end"] - ch["start"])
-                all_slides.extend(part)
-                headings.extend(s.get("heading", "") for s in part)
+                chunks, truncated = split_chunks(snips)
+                if truncated:
+                    st.warning("This video is very long, so only the first part is used.")
+                video_end = chunks[-1]["end"] if chunks else 0
+                for i, ch in enumerate(chunks, 1):
+                    progress.progress(10 + int(65 * (i - 1) / len(chunks)),
+                                      text=f"Creating slides... (part {i} of {len(chunks)})")
+                    part = slides_from_chunk(client, model, ch["text"], i, len(chunks), lang, per_chunk, headings)
+                    for j, sl in enumerate(part):
+                        sl["time"] = ch["start"] + (j + 0.5) / len(part) * (ch["end"] - ch["start"])
+                    all_slides.extend(part)
+                    headings.extend(x.get("heading", "") for x in part)
+            else:
+                duration = get_video_duration(vid)
+                limit = min(duration, MAX_VIDEO_SECONDS) if duration else MAX_VIDEO_SECONDS
+                if duration and duration > MAX_VIDEO_SECONDS:
+                    st.warning("This video is longer than 2 hours, so only the first 2 hours are used.")
+                starts = list(range(0, int(limit), SEGMENT_SECONDS))
+                for k, s0 in enumerate(starts):
+                    e0 = min(s0 + SEGMENT_SECONDS, int(limit))
+                    of_txt = f" of {len(starts)}" if duration else ""
+                    progress.progress(min(10 + int(65 * k / len(starts)), 75),
+                                      text=f"Watching the video and creating slides... (part {k + 1}{of_txt})")
+                    try:
+                        part = slides_from_video(client, model, vid, s0, e0, k + 1, lang, per_chunk, headings)
+                    except Exception:
+                        if all_slides:
+                            break  # most likely we went past the end of the video
+                        raise
+                    if not part:
+                        break
+                    for j, sl in enumerate(part):
+                        sl["time"] = s0 + (j + 0.5) / len(part) * (e0 - s0)
+                    all_slides.extend(part)
+                    headings.extend(x.get("heading", "") for x in part)
+                    video_end = e0
+                if not all_slides:
+                    raise ValueError("No slides could be created from this video.")
+                if duration and video_end < limit - 60:
+                    st.warning(f"Only the first {video_end // 60} minutes could be processed "
+                               "(AI usage limit reached). You can try again later for the rest.")
 
             progress.progress(78, text="Creating summary and quiz...")
             extra = summary_and_quiz(client, model, all_slides, lang, video_title)
@@ -596,6 +683,7 @@ def main():
             hist_err = save_history(title, data)
             st.session_state["result"] = {"data": data, "title": title, "count": len(all_slides)}
             st.session_state["shot_msg"] = shot_msg
+            st.session_state["mode_note"] = mode_note
             if hist_err:
                 st.warning(hist_err)
             progress.progress(100, text="Done!")
@@ -608,6 +696,8 @@ def main():
     res = st.session_state.get("result")
     if res:
         st.success(f"Your presentation is ready: {res['count']} content slides plus summary and quiz.")
+        if st.session_state.get("mode_note"):
+            st.info(st.session_state["mode_note"])
         if st.session_state.get("shot_msg"):
             st.info(st.session_state["shot_msg"])
         safe = re.sub(r"[^\w\- ]", "", res["title"]).strip()[:60] or "lecture"
