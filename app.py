@@ -31,8 +31,8 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-DEFAULT_MODEL = "gemini-2.5-flash"                 # works on the free tier
-FALLBACK_MODELS = ["gemini-2.5-flash-lite"]        # tried automatically if the first one fails
+DEFAULT_MODEL = "gemini-3.8-flash"                 # free tier model (Oct 2026)
+FALLBACK_MODELS = ["gemini-3.6-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]  # tried in order if one fails
 CHUNK_CHARS = 9000                                 # roughly 10 minutes of lecture per part
 MAX_TRANSCRIPT_CHARS = 150000                      # cost / limit protection for very long videos
 SEGMENT_SECONDS = 600                              # video mode: 10 minutes per AI call
@@ -74,7 +74,7 @@ def explain_error(e) -> str:
         return ("The free AI usage limit has been reached. Please wait a minute and try again, "
                 "or try a shorter video / lower detail level.")
     if "404" in m or "not_found" in low:
-        return "The selected AI model is not available. Set GEMINI_MODEL in Secrets (for example gemini-2.5-flash-lite)."
+        return "The selected AI model is not available. Remove GEMINI_MODEL from Secrets, or set it to a current model such as gemini-3.8-flash."
     if "503" in m or "unavailable" in low or "overloaded" in low:
         return "The AI service is busy right now. Please try again in a minute."
     if "invalid_argument" in low and ("video" in low or "youtube" in low or "url" in low):
@@ -232,12 +232,18 @@ def split_chunks(snips, size=CHUNK_CHARS, max_chars=MAX_TRANSCRIPT_CHARS):
 # ----------------------------------------------------------------------
 # Gemini AI
 # ----------------------------------------------------------------------
+_UNAVAILABLE = {}  # model -> time until which we skip it (shared by all users of the app)
+
+
 def ask_ai(client, model, system, user, max_tokens=4000):
-    """Calls Gemini. Retries on rate limits and falls back to a second model if needed."""
+    """Calls Gemini. If a model is missing or its free quota is used up, the next model is tried."""
     models = [model] + [m for m in FALLBACK_MODELS if m != model]
     last_err = None
-    for mdl in models:
-        for attempt in range(2):
+    for round_no in range(2):
+        retryable_seen = False
+        for mdl in models:
+            if _UNAVAILABLE.get(mdl, 0) > time.time():
+                continue  # recently failed, skip it
             try:
                 r = client.models.generate_content(
                     model=mdl,
@@ -253,14 +259,20 @@ def ask_ai(client, model, system, user, max_tokens=4000):
                 last_err = e
                 msg = str(e)
                 if "404" in msg or "NOT_FOUND" in msg:
-                    break  # model missing -> try the next model
-                if any(k in msg for k in ("429", "RESOURCE_EXHAUSTED", "503", "UNAVAILABLE")):
-                    if attempt == 0:
-                        time.sleep(20)  # free tier: wait a little, then retry once
-                        continue
-                    break  # still limited -> try the next model
-                raise
-    raise last_err
+                    _UNAVAILABLE[mdl] = time.time() + 3600   # model does not exist for this key
+                elif "429" in msg or "RESOURCE_EXHAUSTED" in msg:
+                    _UNAVAILABLE[mdl] = time.time() + 300    # free quota used up: try others for 5 min
+                    retryable_seen = True
+                elif "503" in msg or "UNAVAILABLE" in msg or "overloaded" in msg.lower():
+                    retryable_seen = True
+                else:
+                    raise
+        if round_no == 0 and retryable_seen:
+            time.sleep(25)
+            _UNAVAILABLE.clear()  # give every model one more chance
+            continue
+        break
+    raise last_err or RuntimeError("No AI model is available.")
 
 
 def parse_json(raw: str):
