@@ -1,58 +1,124 @@
 """
-YouTube Lecture to PPT  (Gemini + Streamlit)
-Features: language, detail level, colour theme, screenshots, history, quiz.
+Lecture to PPT - website (Streamlit).  The heavy lifting lives in engine.py and pptx_builder.py.
 """
-import json
 import os
 import re
-import subprocess
-import tempfile
-import time
-import urllib.parse
-import urllib.request
 from datetime import datetime, timedelta, timezone
 
 import streamlit as st
 from google import genai
-from google.genai import types
-from youtube_transcript_api import YouTubeTranscriptApi
 
-from pptx_builder import THEMES, build_pptx
+import engine as E
+from pptx_builder import THEMES
 
 st.set_page_config(page_title="Lecture to PPT", page_icon="📚", layout="centered")
 
-# Hide the Streamlit toolbar (GitHub icon, menu) for a cleaner public site
-st.markdown(
-    """
-    <style>
-    [data-testid="stToolbar"], [data-testid="stDecoration"], #MainMenu, footer {display: none !important;}
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-DEFAULT_MODEL = "gemini-3.8-flash"                 # free tier model (Oct 2026)
-FALLBACK_MODELS = ["gemini-3.6-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]  # tried in order if one fails
-CHUNK_CHARS = 9000                                 # roughly 10 minutes of lecture per part
-MAX_TRANSCRIPT_CHARS = 150000                      # cost / limit protection for very long videos
-SEGMENT_SECONDS = 600                              # video mode: 10 minutes per AI call
-MAX_SHOTS = 20                                     # maximum screenshots per deck
-MAX_VIDEO_SECONDS = 2 * 60 * 60                    # no screenshots for videos longer than 2 hours
-BUCKET = "ppts"                                    # Supabase storage bucket name
+BUCKET = "ppts"  # Supabase storage bucket name
 PKT = timezone(timedelta(hours=5))
 MIME = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+VIS_ICON = {"nested": "⭕", "flow": "🔀", "cards": "🗂️", "steps": "🪜", "table": "📊", "tree": "🌳",
+            "network": "🧠", "code": "💻", "compare": "⚖️", None: "📝"}
 
-LANGS = {
-    "English": "English",
-    "Urdu (اردو)": "Urdu (written in Urdu/Arabic script)",
-    "Roman Urdu": "Roman Urdu (Urdu written in English letters)",
-    "Same as the video": "the same language as the transcript",
+CSS = """
+<style>
+:root { --blue:#2F80ED; --sky:#56CCF2; --ink:#12324F; --soft:#EAF4FF; --line:#CFE3FA; }
+html, body, .stApp { color-scheme: light; }
+.stApp {
+  background:
+    radial-gradient(900px 420px at 8% -8%, #D6EAFF 0%, rgba(214,234,255,0) 60%),
+    radial-gradient(800px 420px at 100% 0%, #DDF5FF 0%, rgba(221,245,255,0) 55%),
+    #F7FBFF;
 }
-DETAIL = {
-    "Brief (fewer slides)": "3-4",
-    "Standard": "5-7",
-    "Detailed (more slides)": "8-10",
-}
+[data-testid="stHeader"], [data-testid="stToolbar"], [data-testid="stDecoration"], #MainMenu, footer { display:none !important; }
+.block-container { max-width: 900px; padding-top: 1.4rem; padding-bottom: 4rem; }
+
+/* text */
+.stApp, .stApp p, .stApp li, .stApp label, .stApp h1, .stApp h2, .stApp h3, .stApp h4,
+.stApp [data-testid="stMarkdownContainer"], .stApp [data-testid="stCaptionContainer"] { color: var(--ink); }
+[data-testid="stWidgetLabel"] p { color:#1F4E79 !important; font-weight:600; font-size:.92rem; }
+
+/* hero */
+.hero { position:relative; overflow:hidden; border-radius:28px; padding:2.4rem 2.2rem 2.1rem;
+  background: linear-gradient(135deg, #2F80ED 0%, #4AA8F5 55%, #56CCF2 100%);
+  box-shadow: 0 20px 44px rgba(47,128,237,.28); margin-bottom:1.3rem; animation: rise .6s ease both; }
+.hero .blob { position:absolute; border-radius:50%; background:rgba(255,255,255,.16); animation: floaty 7s ease-in-out infinite; }
+.hero .b1 { width:210px; height:210px; right:-50px; top:-60px; }
+.hero .b2 { width:120px; height:120px; right:140px; bottom:-45px; animation-delay:-3s; }
+.hero .b3 { width:70px; height:70px; left:55%; top:22px; animation-delay:-5s; background:rgba(255,255,255,.22); }
+.hero .badge { display:inline-block; background:rgba(255,255,255,.22); color:#fff !important; padding:.3rem .85rem;
+  border-radius:999px; font-weight:700; font-size:.82rem; letter-spacing:.02em; }
+.hero h1 { color:#fff !important; font-size:2.15rem; line-height:1.15; margin:.75rem 0 .55rem; font-weight:800; padding:0; }
+.hero p.sub { color:rgba(255,255,255,.94) !important; font-size:1.02rem; max-width:560px; margin:0 0 1.1rem; }
+.hero .chip { display:inline-block; padding:.42rem .95rem; margin:.2rem .4rem .2rem 0; border-radius:999px;
+  background:rgba(255,255,255,.2); color:#fff !important; font-weight:600; font-size:.9rem; transition:all .2s; cursor:default; }
+.hero .chip:hover { background:rgba(255,255,255,.34); transform:translateY(-2px); }
+@keyframes floaty { 0%,100% { transform:translateY(0) } 50% { transform:translateY(-14px) } }
+@keyframes rise { from { opacity:0; transform:translateY(12px) } to { opacity:1; transform:none } }
+
+/* cards */
+div[data-testid="stVerticalBlockBorderWrapper"] {
+  background:#fff; border:1px solid #D6E8FB !important; border-radius:22px !important;
+  box-shadow:0 12px 34px rgba(47,128,237,.09); }
+
+/* inputs */
+.stTextInput input, .stTextArea textarea, .stNumberInput input {
+  background:#fff !important; color:var(--ink) !important; border:1.5px solid var(--line) !important;
+  border-radius:12px !important; transition:all .15s; }
+.stTextInput input:focus, .stTextArea textarea:focus { border-color:var(--blue) !important; box-shadow:0 0 0 3px rgba(47,128,237,.16) !important; }
+.stTextInput input::placeholder, .stTextArea textarea::placeholder { color:#8AA6C4 !important; }
+div[data-baseweb="select"] > div { background:#fff !important; border:1.5px solid var(--line) !important; border-radius:12px !important; color:var(--ink) !important; }
+div[data-baseweb="select"] * { color:var(--ink) !important; }
+div[data-baseweb="select"] svg { fill:var(--blue) !important; }
+div[data-baseweb="popover"] ul, div[data-baseweb="popover"] li, div[data-baseweb="popover"] > div { background:#fff !important; color:var(--ink) !important; }
+div[data-baseweb="popover"] li:hover { background:var(--soft) !important; }
+[data-testid="stCheckbox"] label span { color:var(--ink) !important; }
+
+/* buttons */
+.stButton > button, .stDownloadButton > button {
+  border-radius:14px !important; font-weight:700 !important; padding:.7rem 1.3rem !important; transition:all .18s !important; }
+.stButton > button[kind="primary"], button[data-testid="stBaseButton-primary"] {
+  background:linear-gradient(135deg,#2F80ED,#56CCF2) !important; color:#fff !important; border:none !important;
+  box-shadow:0 10px 24px rgba(47,128,237,.32) !important; font-size:1.05rem !important; }
+.stButton > button[kind="primary"]:hover, button[data-testid="stBaseButton-primary"]:hover { transform:translateY(-2px); box-shadow:0 14px 30px rgba(47,128,237,.42) !important; }
+.stButton > button[kind="primary"] p, button[data-testid="stBaseButton-primary"] p { color:#fff !important; }
+.stButton > button:not([kind="primary"]), .stDownloadButton > button {
+  background:#fff !important; color:#1F6FD8 !important; border:1.5px solid var(--line) !important; }
+.stButton > button:not([kind="primary"]) p, .stDownloadButton > button p { color:#1F6FD8 !important; }
+.stButton > button:not([kind="primary"]):hover, .stDownloadButton > button:hover { background:var(--soft) !important; border-color:var(--blue) !important; transform:translateY(-1px); }
+
+/* expander / status / alerts */
+[data-testid="stExpander"] { background:#fff; border:1px solid #D6E8FB !important; border-radius:16px !important; }
+[data-testid="stExpander"] summary p { color:#1F4E79 !important; font-weight:600; }
+[data-testid="stStatus"] { background:#fff !important; border:1px solid #D6E8FB !important; border-radius:18px !important; }
+[data-testid="stAlert"] { border-radius:14px !important; }
+[data-testid="stProgress"] > div > div > div { background:linear-gradient(90deg,#2F80ED,#56CCF2) !important; }
+[data-testid="stProgress"] > div > div { background:#DCEBFB !important; }
+[data-testid="stTooltipContent"], div[data-baseweb="tooltip"] > div { background:#12324F !important; color:#fff !important; }
+
+/* theme swatches & stats */
+.sw { display:flex; align-items:center; gap:.4rem; margin:.1rem 0 .6rem; }
+.sw i { width:22px; height:22px; border-radius:50%; display:inline-block; box-shadow:0 2px 6px rgba(0,0,0,.15); transition:transform .15s; }
+.sw i:hover { transform:scale(1.25); }
+.sw span { font-size:.82rem; color:#5B7A99; margin-left:.4rem; }
+.stats { display:flex; gap:.8rem; margin:.6rem 0 1rem; }
+.stat { flex:1; background:linear-gradient(180deg,#F2F8FF,#fff); border:1px solid #D6E8FB; border-radius:16px; padding:.9rem 1rem; text-align:center; transition:transform .18s; }
+.stat:hover { transform:translateY(-3px); }
+.stat b { display:block; font-size:1.7rem; color:#2F80ED; line-height:1.1; }
+.stat span { font-size:.82rem; color:#5B7A99; }
+.ok-title { font-size:1.25rem; font-weight:800; color:#12324F; margin:.2rem 0 0; }
+</style>
+"""
+
+HERO = """
+<div class="hero">
+  <div class="blob b1"></div><div class="blob b2"></div><div class="blob b3"></div>
+  <span class="badge">✨ AI presentation maker for teachers</span>
+  <h1>Turn any lecture video into a beautiful presentation</h1>
+  <p class="sub">Paste a YouTube link and get designed slides with diagrams, flow charts, tables,
+  code and speaker notes, ready to teach.</p>
+  <span class="chip">1 · Paste the link</span><span class="chip">2 · AI designs the slides</span><span class="chip">3 · Download your PPT</span>
+</div>
+"""
 
 
 def get_secret(name, default=None):
@@ -62,406 +128,6 @@ def get_secret(name, default=None):
     except Exception:
         pass
     return os.environ.get(name, default)
-
-
-def explain_error(e) -> str:
-    """Turn a technical error into a clear message for the user."""
-    m = str(e)
-    low = m.lower()
-    if "api_key_invalid" in low or "api key not valid" in low or "permission_denied" in low or "unauthenticated" in low:
-        return "The AI service rejected the API key. Check GEMINI_API_KEY in the app's Secrets."
-    if "429" in m or "resource_exhausted" in low or "quota" in low:
-        return ("The free AI usage limit has been reached. Please wait a minute and try again, "
-                "or try a shorter video / lower detail level.")
-    if "404" in m or "not_found" in low:
-        return "The selected AI model is not available. Remove GEMINI_MODEL from Secrets, or set it to a current model such as gemini-3.8-flash."
-    if "503" in m or "unavailable" in low or "overloaded" in low:
-        return "The AI service is busy right now. Please try again in a minute."
-    if "invalid_argument" in low and ("video" in low or "youtube" in low or "url" in low):
-        return "The AI could not access this video. It must be a public YouTube video (not private or age-restricted)."
-    if "valid json" in low or "format" in low:
-        return "The AI returned an unexpected format. Please try again."
-    return "Something went wrong while generating the slides. Please try again."
-
-
-# ----------------------------------------------------------------------
-# YouTube: link, info, transcript
-# ----------------------------------------------------------------------
-def extract_video_id(url: str):
-    url = url.strip()
-    m = re.search(r"(?:v=|/videos/|embed/|youtu\.be/|/shorts/|/live/)([A-Za-z0-9_-]{11})", url)
-    if m:
-        return m.group(1)
-    if re.fullmatch(r"[A-Za-z0-9_-]{11}", url):
-        return url
-    return None
-
-
-def get_video_info(video_id: str):
-    try:
-        watch = f"https://www.youtube.com/watch?v={video_id}"
-        api = "https://www.youtube.com/oembed?format=json&url=" + urllib.parse.quote(watch)
-        with urllib.request.urlopen(api, timeout=10) as r:
-            data = json.loads(r.read().decode("utf-8"))
-        return data.get("title", ""), data.get("author_name", "")
-    except Exception:
-        return "", ""
-
-
-def transcript_via_api(video_id: str):
-    """Main method: youtube-transcript-api. Returns [(start, duration, text), ...]."""
-    proxy = get_secret("PROXY_URL")
-    if proxy:
-        from youtube_transcript_api.proxies import GenericProxyConfig
-
-        api = YouTubeTranscriptApi(proxy_config=GenericProxyConfig(http_url=proxy, https_url=proxy))
-    else:
-        api = YouTubeTranscriptApi()
-    transcripts = api.list(video_id)
-    try:
-        t = transcripts.find_transcript(["ur", "hi", "en"])
-    except Exception:
-        t = next(iter(transcripts))
-    out = []
-    for s in t.fetch():
-        txt = re.sub(r"\s+", " ", s.text.replace("\n", " ")).strip()
-        if txt:
-            out.append((float(s.start), float(s.duration), txt))
-    return out
-
-
-def transcript_via_ytdlp(video_id: str):
-    """Backup method: read the caption track through yt-dlp."""
-    from yt_dlp import YoutubeDL
-
-    opts = {"quiet": True, "no_warnings": True, "skip_download": True, "socket_timeout": 20}
-    proxy = get_secret("PROXY_URL")
-    if proxy:
-        opts["proxy"] = proxy
-    with YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
-    for source in (info.get("subtitles") or {}, info.get("automatic_captions") or {}):
-        for lang in ("ur", "hi", "en"):
-            for key in [k for k in source if k == lang or k.startswith(lang + "-")]:
-                for fmt in source[key]:
-                    if fmt.get("ext") != "json3":
-                        continue
-                    with urllib.request.urlopen(fmt["url"], timeout=20) as r:
-                        data = json.loads(r.read().decode("utf-8"))
-                    out = []
-                    for ev in data.get("events", []):
-                        txt = "".join(sg.get("utf8", "") for sg in (ev.get("segs") or []))
-                        txt = re.sub(r"\s+", " ", txt.replace("\n", " ")).strip()
-                        if txt:
-                            out.append((ev.get("tStartMs", 0) / 1000, ev.get("dDurationMs", 0) / 1000, txt))
-                    if out:
-                        return out
-    raise RuntimeError("No caption track found")
-
-
-def get_transcript(video_id: str):
-    try:
-        return transcript_via_api(video_id)
-    except Exception as first_error:
-        try:
-            return transcript_via_ytdlp(video_id)
-        except Exception:
-            raise first_error
-
-
-def transcript_error_message(e) -> str:
-    name = type(e).__name__
-    if name in ("TranscriptsDisabled", "NoTranscriptFound"):
-        return ("This video has no captions, so a transcript is not available. "
-                "Try another video, or paste the transcript manually.")
-    if name in ("VideoUnavailable", "VideoUnplayable", "InvalidVideoId"):
-        return "This video is unavailable or private."
-    if name in ("IpBlocked", "RequestBlocked", "YouTubeRequestFailed", "AgeRestricted"):
-        return ("YouTube is temporarily blocking requests from this server. "
-                "Please try again later, or paste the transcript manually below.")
-    return ("The transcript for this video could not be retrieved. YouTube may be blocking the server. "
-            "Please try again later, or paste the transcript manually.")
-
-
-def parse_manual_transcript(text: str):
-    """Parses text copied from YouTube's 'Show transcript' panel.
-    Returns (snippets, has_timestamps)."""
-    ts = re.compile(r"^(?:(\d{1,2}):)?(\d{1,2}):(\d{2})$")
-    snips, cur_time, has_ts, n = [], 0.0, False, 0
-    for line in text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        m = ts.match(line)
-        if m:
-            h, mi, sec = int(m.group(1) or 0), int(m.group(2)), int(m.group(3))
-            cur_time, has_ts = h * 3600 + mi * 60 + sec, True
-            continue
-        if not has_ts:
-            cur_time = n * 5.0  # no timestamps: rough placeholder times
-        snips.append((float(cur_time), 5.0, line))
-        n += 1
-    return snips, has_ts
-
-
-def split_chunks(snips, size=CHUNK_CHARS, max_chars=MAX_TRANSCRIPT_CHARS):
-    chunks, cur, n, total, truncated = [], [], 0, 0, False
-
-    def flush():
-        if cur:
-            chunks.append({
-                "text": " ".join(x[2] for x in cur),
-                "start": cur[0][0],
-                "end": cur[-1][0] + cur[-1][1],
-            })
-
-    for sn in snips:
-        if total + len(sn[2]) > max_chars:
-            truncated = True
-            break
-        cur.append(sn)
-        n += len(sn[2]) + 1
-        total += len(sn[2]) + 1
-        if n >= size:
-            flush()
-            cur, n = [], 0
-    flush()
-    return chunks, truncated
-
-
-# ----------------------------------------------------------------------
-# Gemini AI
-# ----------------------------------------------------------------------
-_UNAVAILABLE = {}  # model -> time until which we skip it (shared by all users of the app)
-
-
-def ask_ai(client, model, system, user, max_tokens=4000):
-    """Calls Gemini. If a model is missing or its free quota is used up, the next model is tried."""
-    models = [model] + [m for m in FALLBACK_MODELS if m != model]
-    last_err = None
-    for round_no in range(2):
-        retryable_seen = False
-        for mdl in models:
-            if _UNAVAILABLE.get(mdl, 0) > time.time():
-                continue  # recently failed, skip it
-            try:
-                r = client.models.generate_content(
-                    model=mdl,
-                    contents=user,
-                    config=types.GenerateContentConfig(
-                        system_instruction=system,
-                        max_output_tokens=max_tokens + 4000,
-                        response_mime_type="application/json",
-                    ),
-                )
-                return r.text or ""
-            except Exception as e:
-                last_err = e
-                msg = str(e)
-                if "404" in msg or "NOT_FOUND" in msg:
-                    _UNAVAILABLE[mdl] = time.time() + 3600   # model does not exist for this key
-                elif "429" in msg or "RESOURCE_EXHAUSTED" in msg:
-                    _UNAVAILABLE[mdl] = time.time() + 300    # free quota used up: try others for 5 min
-                    retryable_seen = True
-                elif "503" in msg or "UNAVAILABLE" in msg or "overloaded" in msg.lower():
-                    retryable_seen = True
-                else:
-                    raise
-        if round_no == 0 and retryable_seen:
-            time.sleep(25)
-            _UNAVAILABLE.clear()  # give every model one more chance
-            continue
-        break
-    raise last_err or RuntimeError("No AI model is available.")
-
-
-def parse_json(raw: str):
-    raw = raw.strip()
-    raw = re.sub(r"^```(?:json)?", "", raw).strip()
-    raw = re.sub(r"```$", "", raw).strip()
-    a, b = raw.find("{"), raw.rfind("}")
-    if a == -1 or b == -1:
-        raise ValueError("No JSON found")
-    return json.loads(raw[a : b + 1])
-
-
-def ask_json(client, model, system, user, max_tokens=4000, video=None):
-    for _ in range(2):
-        contents = [video, user] if video is not None else user
-        raw = ask_ai(client, model, system, contents, max_tokens)
-        try:
-            return parse_json(raw)
-        except Exception:
-            user += "\n\nYour previous answer was not valid JSON. Return only valid JSON."
-    raise ValueError("The AI did not return a valid JSON format.")
-
-
-def slides_from_chunk(client, model, chunk, idx, total, lang, per_chunk, done_headings):
-    system = f"""You are an expert teacher's assistant. You turn a part of a lecture
-transcript into detailed presentation slides for a classroom.
-
-Rules:
-- Cover EVERY concept, definition, example, formula, step and important point the teacher explains in this part.
-- Do not invent facts that are not in the transcript. The transcript comes from auto-captions, so silently fix obvious spelling mistakes.
-- Output language: {lang}.
-- Make about {per_chunk} slides for this part.
-- Each slide: a short heading, 3-6 bullets (each bullet a complete, useful line), and speaker "notes" (3-6 sentences with the full explanation for the teacher).
-- Skip greetings, subscribe requests, and ads.
-- Return ONLY valid JSON, no extra text, in this exact shape:
-{{"slides": [{{"heading": "...", "bullets": ["...", "..."], "notes": "..."}}]}}"""
-    user = f"""This is part {idx} of {total} of the lecture.
-Headings already made in earlier parts (do not repeat them): {done_headings[-15:]}
-
-TRANSCRIPT PART:
-{chunk}"""
-    return ask_json(client, model, system, user, max_tokens=6000).get("slides", [])
-
-
-def get_video_duration(video_id):
-    """Video length in seconds, or None if it cannot be found."""
-    try:
-        req = urllib.request.Request(
-            f"https://www.youtube.com/watch?v={video_id}",
-            headers={"User-Agent": "Mozilla/5.0", "Accept-Language": "en-US,en;q=0.9"},
-        )
-        with urllib.request.urlopen(req, timeout=10) as r:
-            html = r.read().decode("utf-8", "ignore")
-        m = re.search(r'"lengthSeconds":"(\d+)"', html)
-        if m:
-            return int(m.group(1))
-    except Exception:
-        pass
-    try:
-        from yt_dlp import YoutubeDL
-
-        with YoutubeDL({"quiet": True, "no_warnings": True, "skip_download": True, "socket_timeout": 15}) as ydl:
-            info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
-        return int(info.get("duration") or 0) or None
-    except Exception:
-        return None
-
-
-def slides_from_video(client, model, video_id, start, end, idx, lang, per_chunk, done_headings):
-    """Video mode: Gemini watches one segment of the public YouTube video directly."""
-    system = f"""You are an expert teacher's assistant. You are given one segment of a lecture video
-(its audio and visuals). Turn what the teacher says AND any text, formulas or diagrams shown on screen
-into detailed presentation slides for a classroom.
-
-Rules:
-- Cover EVERY concept, definition, example, formula, step and important point in this segment.
-- Do not invent facts that are not in the video.
-- Output language: {lang}.
-- Make about {per_chunk} slides for this segment.
-- Each slide: a short heading, 3-6 bullets (each bullet a complete, useful line), and speaker "notes" (3-6 sentences with the full explanation for the teacher).
-- Skip greetings, subscribe requests, and ads.
-- If this segment has no lecture content, return {{"slides": []}}.
-- Return ONLY valid JSON, no extra text, in this exact shape:
-{{"slides": [{{"heading": "...", "bullets": ["...", "..."], "notes": "..."}}]}}"""
-    user = f"""This is segment {idx} of the lecture ({start // 60} to {end // 60} minutes).
-Headings already made in earlier segments (do not repeat them): {done_headings[-15:]}"""
-    video = types.Part(
-        file_data=types.FileData(file_uri=f"https://www.youtube.com/watch?v={video_id}"),
-        video_metadata=types.VideoMetadata(start_offset=f"{int(start)}s", end_offset=f"{int(end)}s"),
-    )
-    return ask_json(client, model, system, user, max_tokens=6000, video=video).get("slides", [])
-
-
-def summary_and_quiz(client, model, slides, lang, video_title):
-    outline = "\n".join(
-        f"- {s.get('heading', '')}: " + "; ".join(s.get("bullets", [])[:3]) for s in slides
-    )
-    system = f"""You help a teacher. From the lecture outline, produce a good presentation title,
-a summary and a short quiz. Output language: {lang}.
-Return ONLY valid JSON in this shape:
-{{"title": "...", "summary": ["5-7 key takeaways"], "quiz": [{{"q": "...", "a": "..."}}]}}
-Give 5 quiz questions with short answers."""
-    return ask_json(client, model, system, f"Video title: {video_title}\n\nOUTLINE:\n{outline}", max_tokens=3000)
-
-
-# ----------------------------------------------------------------------
-# Screenshots
-# ----------------------------------------------------------------------
-def grab_frames(video_id, times):
-    """Grabs one frame at each given time (seconds). Returns {position: jpg_bytes}.
-    Uses yt-dlp to get the stream URL and ffmpeg to pull only the needed frames."""
-    from yt_dlp import YoutubeDL
-
-    opts = {
-        "format": "best[height<=480][ext=mp4]/best[height<=480]/best",
-        "quiet": True, "no_warnings": True, "noplaylist": True, "socket_timeout": 20,
-    }
-    proxy = get_secret("PROXY_URL")
-    if proxy:
-        opts["proxy"] = proxy
-    with YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
-    stream = info.get("url")
-    if not stream:
-        return {}
-    headers = info.get("http_headers", {}) or {}
-    hdr = "".join(f"{k}: {v}\r\n" for k, v in headers.items())
-
-    frames = {}
-    with tempfile.TemporaryDirectory() as tmp:
-        for i, t in enumerate(times):
-            fp = os.path.join(tmp, f"f{i}.jpg")
-            cmd = ["ffmpeg", "-y", "-loglevel", "error"]
-            if hdr:
-                cmd += ["-headers", hdr]
-            cmd += ["-ss", str(int(t)), "-i", stream, "-frames:v", "1",
-                    "-vf", "scale=720:-2", "-q:v", "4", fp]
-            try:
-                subprocess.run(cmd, capture_output=True, timeout=45)
-            except Exception:
-                continue
-            if os.path.exists(fp) and os.path.getsize(fp) > 2000:
-                with open(fp, "rb") as f:
-                    frames[i] = f.read()
-    return frames
-
-
-def youtube_thumbnails(video_id):
-    """Backup: YouTube's own 3 preview frames (about 25%, 50%, 75% into the video)."""
-    out = []
-    for name in ("hq1.jpg", "hq2.jpg", "hq3.jpg"):
-        try:
-            with urllib.request.urlopen(f"https://img.youtube.com/vi/{video_id}/{name}", timeout=10) as r:
-                b = r.read()
-            if len(b) > 2000:
-                out.append(b)
-        except Exception:
-            pass
-    return out
-
-
-def attach_screenshots(video_id, slides):
-    """Adds an 'image' key to slides. Returns a status message."""
-    n = len(slides)
-    if n == 0:
-        return ""
-    if n <= MAX_SHOTS:
-        idxs = list(range(n))
-    else:
-        idxs = sorted({round(k * (n - 1) / (MAX_SHOTS - 1)) for k in range(MAX_SHOTS)})
-    times = [slides[i].get("time", 0) for i in idxs]
-
-    try:
-        frames = grab_frames(video_id, times)
-    except Exception:
-        frames = {}
-    if frames:
-        for pos, data in frames.items():
-            slides[idxs[pos]]["image"] = data
-        return f"Video screenshots were added to {len(frames)} slides."
-
-    thumbs = youtube_thumbnails(video_id)
-    if thumbs:
-        spots = [round(n * f) for f in (0.25, 0.5, 0.75)]
-        for k, data in enumerate(thumbs):
-            slides[min(spots[k], n - 1)]["image"] = data
-        return ("Frames could not be taken from the video (YouTube blocked the server), "
-                f"so {len(thumbs)} YouTube preview images were used instead.")
-    return "Screenshots were not available, so the presentation was created without them."
 
 
 # ----------------------------------------------------------------------
@@ -483,9 +149,7 @@ def save_history(title, data):
     store = get_store()
     if store:
         try:
-            store.storage.from_(BUCKET).upload(
-                path=name, file=data, file_options={"content-type": MIME}
-            )
+            store.storage.from_(BUCKET).upload(path=name, file=data, file_options={"content-type": MIME})
             return ""
         except Exception as e:
             return f"Could not save to history: {str(e)[:200]}"
@@ -498,8 +162,7 @@ def list_history():
     if store:
         try:
             rows = store.storage.from_(BUCKET).list(
-                "", {"limit": 50, "sortBy": {"column": "created_at", "order": "desc"}}
-            )
+                "", {"limit": 50, "sortBy": {"column": "created_at", "order": "desc"}})
             names = sorted((r["name"] for r in rows if r["name"].endswith(".pptx")), reverse=True)
             return [{"name": n, "data": None} for n in names[:30]]
         except Exception:
@@ -510,8 +173,7 @@ def list_history():
 def pretty(name):
     try:
         d = datetime.strptime(name[:15], "%Y%m%d-%H%M%S").strftime("%d %b %Y, %I:%M %p")
-        title = name.split("__", 1)[1][:-5].replace("-", " ")
-        return f"{d}  —  {title}"
+        return f"{d}  —  {name.split('__', 1)[1][:-5].replace('-', ' ')}"
     except Exception:
         return name
 
@@ -523,13 +185,12 @@ def show_history():
             st.warning("History could not be loaded. Please check the storage settings.")
             return
         if not get_store():
-            st.caption("History is currently kept only for this browser session.")
+            st.caption("History is kept only for this browser session.")
         if not items:
             st.write("No presentations yet.")
         for it in items:
             st.write(pretty(it["name"]))
-            data = it["data"]
-            key = f"dl::{it['name']}"
+            data, key = it["data"], f"dl::{it['name']}"
             if data is None:
                 data = st.session_state.get(key)
                 if data is None:
@@ -545,13 +206,15 @@ def show_history():
 
 
 # ----------------------------------------------------------------------
-# Website
+# Page
 # ----------------------------------------------------------------------
 def password_gate():
     pw = get_secret("APP_PASSWORD")
     if not pw or st.session_state.get("authed"):
         return True
-    entered = st.text_input("Password", type="password")
+    with st.container(border=True):
+        st.markdown("**🔒 This app is private.** Enter the password to continue.")
+        entered = st.text_input("Password", type="password")
     if entered:
         if entered == pw:
             st.session_state["authed"] = True
@@ -561,9 +224,34 @@ def password_gate():
     return False
 
 
+def swatches(theme_name):
+    T = THEMES[theme_name]
+    cols = [T["dark"]] + T["acc"] + [T["light"]]
+    dots = "".join(f'<i style="background:#{c}"></i>' for c in cols)
+    return f'<div class="sw">{dots}<span>{theme_name} palette</span></div>'
+
+
+def show_result(res):
+    st.markdown(f'<p class="ok-title">🎉 Your presentation is ready</p>', unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="stats"><div class="stat"><b>{res["slides"]}</b><span>content slides</span></div>'
+        f'<div class="stat"><b>{res["visuals"]}</b><span>with diagrams</span></div>'
+        f'<div class="stat"><b>{res["shots"]}</b><span>screenshots</span></div></div>',
+        unsafe_allow_html=True)
+    safe = re.sub(r"[^\w\- ]", "", res["title"]).strip()[:60] or "lecture"
+    st.download_button("⬇️ Download PowerPoint", res["data"], file_name=f"{safe}.pptx", mime=MIME,
+                       use_container_width=True, type="primary")
+    for n in res["notes"]:
+        st.info(n)
+    with st.expander("👀 Slide outline"):
+        for i, (head, vis, shot) in enumerate(res["outline"], 1):
+            st.write(f"{VIS_ICON.get(vis, '🧩')} **{i}.** {head}" + ("  📸" if shot else ""))
+    st.caption("Please review the slides before presenting. The speaker notes hold the full explanation.")
+
+
 def main():
-    st.title("📚 Lecture to PPT")
-    st.caption("Paste a YouTube lecture link and get a detailed, ready-to-use presentation.")
+    st.markdown(CSS, unsafe_allow_html=True)
+    st.markdown(HERO, unsafe_allow_html=True)
 
     if not password_gate():
         st.stop()
@@ -573,152 +261,73 @@ def main():
         st.error("The app is not configured yet: GEMINI_API_KEY is missing in Secrets.")
         st.stop()
 
-    url = st.text_input("YouTube video link", placeholder="https://www.youtube.com/watch?v=...")
-    with st.expander("Having trouble with a video? Paste the transcript instead"):
-        manual = st.text_area("Transcript (optional)", height=150, key="manual_transcript")
-        st.caption("On YouTube: open the video, expand the description, click \"Show transcript\", "
-                   "select all the text and copy it here. Timestamps are supported.")
-    c1, c2 = st.columns(2)
-    lang_label = c1.selectbox("Slide language", list(LANGS.keys()))
-    detail_label = c2.selectbox("Detail level", list(DETAIL.keys()), index=1)
-    c3, c4 = st.columns(2)
-    theme_name = c3.selectbox("Theme", list(THEMES.keys()))
-    want_shots = c4.checkbox(
-        "Add video screenshots to slides", value=False,
-        help="Slower, and may not work on every server. If it fails, YouTube preview images are used.",
-    )
+    with st.container(border=True):
+        url = st.text_input("YouTube video link", placeholder="https://www.youtube.com/watch?v=...")
+        with st.expander("Having trouble with a video? Paste the transcript instead"):
+            manual = st.text_area("Transcript (optional)", height=140, key="manual_transcript")
+            st.caption('On YouTube: open the video, expand the description, click "Show transcript", '
+                       "select all the text and copy it here. Timestamps are supported.")
+        c1, c2, c3 = st.columns(3)
+        lang_label = c1.selectbox("Slide language", list(E.LANGS.keys()))
+        detail_label = c2.selectbox("Detail level", list(E.DETAIL.keys()), index=1)
+        theme_name = c3.selectbox("Theme", list(THEMES.keys()))
+        st.markdown(swatches(theme_name), unsafe_allow_html=True)
+        want_shots = st.checkbox(
+            "Capture notes and code from the video (slower)", value=True,
+            help="Adds screenshots only where handwritten notes, a board, text slides or code are shown. "
+                 "Photos of the teacher are never added.")
+        go = st.button("✨ Create presentation", type="primary", use_container_width=True)
 
-    if st.button("Create presentation", type="primary") and url:
-        vid = extract_video_id(url)
-        if not vid:
-            st.error("This does not look like a valid YouTube link. Please check it and try again.")
-            st.stop()
+    if go:
+        if not url.strip():
+            st.warning("Please paste a YouTube link first.")
+        else:
+            warnings, err = [], None
+            with st.status("Creating your presentation…", expanded=True) as status:
+                bar = st.progress(0)
 
-        lang = LANGS[lang_label]
-        rtl = lang_label.startswith("Urdu")
-        per_chunk = DETAIL[detail_label]
-        model = get_secret("GEMINI_MODEL", DEFAULT_MODEL)
-        client = genai.Client(api_key=api_key)
-        progress = st.progress(0, text="Fetching video details...")
-        st.session_state.pop("shot_msg", None)
-        st.session_state.pop("mode_note", None)
+                def say(m):
+                    st.write(m)
 
-        try:
-            video_title, channel = get_video_info(vid)
+                def prog(f, t):
+                    bar.progress(max(0, min(int(f * 100), 100)), text=t)
 
-            progress.progress(5, text="Getting the transcript...")
-            manual_text = (manual or "").strip()
-            snips, mode, mode_note = None, "transcript", ""
-            if len(manual_text) >= 200:
-                snips, has_ts = parse_manual_transcript(manual_text)
-                if not has_ts:
-                    want_shots = False  # screenshots need real timestamps
-            else:
+                def warn(m):
+                    warnings.append(m)
+                    st.write("⚠️ " + m)
+
                 try:
-                    snips = get_transcript(vid)
+                    model = get_secret("GEMINI_MODEL", E.DEFAULT_MODEL)
+                    client = genai.Client(api_key=api_key)
+                    res = E.generate_presentation(
+                        url, manual, lang_label, detail_label, theme_name, want_shots, client, model,
+                        proxy=get_secret("PROXY_URL"), say=say, prog=prog, warn=warn)
+                    hist_err = save_history(res["title"], res["data"])
+                    if hist_err:
+                        warnings.append(hist_err)
+                    res["notes"] = warnings + res["notes"]
+                    st.session_state["result"] = res
+                    status.update(label="Your presentation is ready!", state="complete", expanded=False)
+                    st.toast("Presentation ready! 🎉")
                 except Exception as e:
-                    if type(e).__name__ in ("VideoUnavailable", "VideoUnplayable", "InvalidVideoId"):
-                        progress.empty()
-                        st.error(transcript_error_message(e))
-                        st.stop()
-                    # Transcript blocked or missing -> let Gemini watch the video directly
-                    mode = "video"
-                    mode_note = ("The transcript could not be retrieved, so the AI analysed the video directly "
-                                 "instead. This is slower for long videos.")
-
-            all_slides, headings, video_end = [], [], 0
-
-            if mode == "transcript":
-                if sum(len(x[2]) for x in snips) < 200:
-                    progress.empty()
-                    st.error("The transcript is too short to create a presentation.")
-                    st.stop()
-                chunks, truncated = split_chunks(snips)
-                if truncated:
-                    st.warning("This video is very long, so only the first part is used.")
-                video_end = chunks[-1]["end"] if chunks else 0
-                for i, ch in enumerate(chunks, 1):
-                    progress.progress(10 + int(65 * (i - 1) / len(chunks)),
-                                      text=f"Creating slides... (part {i} of {len(chunks)})")
-                    part = slides_from_chunk(client, model, ch["text"], i, len(chunks), lang, per_chunk, headings)
-                    for j, sl in enumerate(part):
-                        sl["time"] = ch["start"] + (j + 0.5) / len(part) * (ch["end"] - ch["start"])
-                    all_slides.extend(part)
-                    headings.extend(x.get("heading", "") for x in part)
-            else:
-                duration = get_video_duration(vid)
-                limit = min(duration, MAX_VIDEO_SECONDS) if duration else MAX_VIDEO_SECONDS
-                if duration and duration > MAX_VIDEO_SECONDS:
-                    st.warning("This video is longer than 2 hours, so only the first 2 hours are used.")
-                starts = list(range(0, int(limit), SEGMENT_SECONDS))
-                for k, s0 in enumerate(starts):
-                    e0 = min(s0 + SEGMENT_SECONDS, int(limit))
-                    of_txt = f" of {len(starts)}" if duration else ""
-                    progress.progress(min(10 + int(65 * k / len(starts)), 75),
-                                      text=f"Watching the video and creating slides... (part {k + 1}{of_txt})")
-                    try:
-                        part = slides_from_video(client, model, vid, s0, e0, k + 1, lang, per_chunk, headings)
-                    except Exception:
-                        if all_slides:
-                            break  # most likely we went past the end of the video
-                        raise
-                    if not part:
-                        break
-                    for j, sl in enumerate(part):
-                        sl["time"] = s0 + (j + 0.5) / len(part) * (e0 - s0)
-                    all_slides.extend(part)
-                    headings.extend(x.get("heading", "") for x in part)
-                    video_end = e0
-                if not all_slides:
-                    raise ValueError("No slides could be created from this video.")
-                if duration and video_end < limit - 60:
-                    st.warning(f"Only the first {video_end // 60} minutes could be processed "
-                               "(AI usage limit reached). You can try again later for the rest.")
-
-            progress.progress(78, text="Creating summary and quiz...")
-            extra = summary_and_quiz(client, model, all_slides, lang, video_title)
-
-            shot_msg = ""
-            if want_shots:
-                if video_end > MAX_VIDEO_SECONDS:
-                    shot_msg = "The video is longer than 2 hours, so screenshots were skipped."
+                    err = e
+                    status.update(label="Could not create the presentation", state="error", expanded=True)
+            if err is not None:
+                st.session_state.pop("result", None)
+                if isinstance(err, E.UserError):
+                    st.error(err.msg)
                 else:
-                    progress.progress(82, text="Capturing video screenshots (this takes a while)...")
-                    shot_msg = attach_screenshots(vid, all_slides)
-
-            progress.progress(95, text="Building the PowerPoint file...")
-            title = extra.get("title") or video_title or "Lecture"
-            data = build_pptx(title, channel, f"https://www.youtube.com/watch?v={vid}",
-                              all_slides, extra.get("summary", []), extra.get("quiz", []),
-                              rtl, theme_name)
-
-            hist_err = save_history(title, data)
-            st.session_state["result"] = {"data": data, "title": title, "count": len(all_slides)}
-            st.session_state["shot_msg"] = shot_msg
-            st.session_state["mode_note"] = mode_note
-            if hist_err:
-                st.warning(hist_err)
-            progress.progress(100, text="Done!")
-        except Exception as e:
-            progress.empty()
-            st.error(explain_error(e))
-            with st.expander("Technical details"):
-                st.code(f"{type(e).__name__}: {str(e)[:1500]}")
+                    st.error(E.explain_error(err))
+                st.caption("Tip: if YouTube is blocking the server, paste the transcript manually in the box above.")
+                with st.expander("Technical details"):
+                    st.code(f"{type(err).__name__}: {str(err)[:1500]}")
 
     res = st.session_state.get("result")
     if res:
-        st.success(f"Your presentation is ready: {res['count']} content slides plus summary and quiz.")
-        if st.session_state.get("mode_note"):
-            st.info(st.session_state["mode_note"])
-        if st.session_state.get("shot_msg"):
-            st.info(st.session_state["shot_msg"])
-        safe = re.sub(r"[^\w\- ]", "", res["title"]).strip()[:60] or "lecture"
-        st.download_button("⬇️ Download PPT", res["data"], file_name=f"{safe}.pptx", mime=MIME)
-        st.info("Please review the slides before presenting. The speaker notes contain the full explanation.")
+        with st.container(border=True):
+            show_result(res)
 
     show_history()
-    st.divider()
-    st.caption("The presentation credits the original channel. Please do not share someone else's content as your own.")
 
 
 main()
