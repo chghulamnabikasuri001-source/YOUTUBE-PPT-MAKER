@@ -636,7 +636,7 @@ def draw_image(slide, ctx, img_bytes, x, y, w, h):
     slide.shapes.add_picture(io.BytesIO(img_bytes), Inches(px), Inches(py), Inches(pw), Inches(ph))
 
 
-def draw_rows(slide, ctx, items, x, y, w, h, numbered=True):
+def draw_rows(slide, ctx, items, x, y, w, h, numbered=True, start=0):
     """items: list of (main, sub). Used for takeaways, quiz, answers, and plain bullet slides."""
     n = len(items)
     gap = 0.2
@@ -650,7 +650,7 @@ def draw_rows(slide, ctx, items, x, y, w, h, numbered=True):
         bx = x + w - 0.76 if ctx.rtl else x + 0.22
         b = add_shape(slide, MSO_SHAPE.OVAL, bx, ry + rh / 2 - 0.27, 0.54, 0.54, fill=c)
         if numbered:
-            shape_text(b, ctx, [dict(t=str(i + 1), size=16, color=ctx.on(c), bold=True, head=True,
+            shape_text(b, ctx, [dict(t=str(start + i + 1), size=16, color=ctx.on(c), bold=True, head=True,
                                      align=PP_ALIGN.CENTER)], margins=(0, 0))
         tw = w - 1.2
         both = [main] + ([sub] if sub else [])
@@ -846,23 +846,35 @@ def build_pptx(title, tagline, channel, video_url, slides, takeaways, quiz, rtl,
             safe = dict(ns, visual=None, image=None)
             build_content_slide(prs, ctx, safe, i, total)
 
+    def _pages(lst, n):
+        return [lst[i:i + n] for i in range(0, len(lst), n)]
+
     if takeaways:
-        ctx = Ctx(T, True, rtl)
-        s = _new_slide(prs, ctx)
-        add_text(s, ctx, 0.7, 0.45, 11.93, 1.2,
-                 [dict(t="اہم نکات" if rtl else "Key takeaways", size=38, color=ctx.text, bold=True, head=True)],
-                 MSO_ANCHOR.MIDDLE)
-        draw_rows(s, ctx, [(t, None) for t in takeaways[:6]], 0.7, 1.8, 11.93, 5.2)
+        pages = _pages(list(takeaways), 6)
+        for pi, pg in enumerate(pages):
+            ctx = Ctx(T, True, rtl)
+            s = _new_slide(prs, ctx)
+            base = "اہم نکات" if rtl else "Key takeaways"
+            head = f"{base} ({pi + 1}/{len(pages)})" if len(pages) > 1 else base
+            add_text(s, ctx, 0.7, 0.45, 11.93, 1.2,
+                     [dict(t=head, size=38, color=ctx.text, bold=True, head=True)], MSO_ANCHOR.MIDDLE)
+            draw_rows(s, ctx, [(t, None) for t in pg], 0.7, 1.8, 11.93, 5.2, start=pi * 6)
     if quiz:
-        ctx = Ctx(T, False, rtl)
-        s = _new_slide(prs, ctx)
-        add_text(s, ctx, 0.7, 0.45, 11.93, 1.2,
-                 [dict(t="کوئز" if rtl else "Quick quiz", size=38, color=ctx.text, bold=True, head=True)], MSO_ANCHOR.MIDDLE)
-        draw_rows(s, ctx, [(str(q.get("q", "")), None) for q in quiz[:5]], 0.7, 1.8, 11.93, 5.2)
-        s2 = _new_slide(prs, ctx)
-        add_text(s2, ctx, 0.7, 0.45, 11.93, 1.2,
-                 [dict(t="جوابات" if rtl else "Answers", size=38, color=ctx.text, bold=True, head=True)], MSO_ANCHOR.MIDDLE)
-        draw_rows(s2, ctx, [(str(q.get("q", "")), str(q.get("a", ""))) for q in quiz[:5]], 0.7, 1.8, 11.93, 5.2)
+        pages = _pages(list(quiz), 5)
+        for pi, pg in enumerate(pages):
+            ctx = Ctx(T, False, rtl)
+            suffix = f" ({pi + 1}/{len(pages)})" if len(pages) > 1 else ""
+            s = _new_slide(prs, ctx)
+            add_text(s, ctx, 0.7, 0.45, 11.93, 1.2,
+                     [dict(t=("کوئز" if rtl else "Quick quiz") + suffix, size=38, color=ctx.text, bold=True, head=True)],
+                     MSO_ANCHOR.MIDDLE)
+            draw_rows(s, ctx, [(str(q.get("q", "")), None) for q in pg], 0.7, 1.8, 11.93, 5.2, start=pi * 5)
+            s2 = _new_slide(prs, ctx)
+            add_text(s2, ctx, 0.7, 0.45, 11.93, 1.2,
+                     [dict(t=("جوابات" if rtl else "Answers") + suffix, size=38, color=ctx.text, bold=True, head=True)],
+                     MSO_ANCHOR.MIDDLE)
+            draw_rows(s2, ctx, [(str(q.get("q", "")), str(q.get("a", ""))) for q in pg], 0.7, 1.8, 11.93, 5.2,
+                      start=pi * 5)
 
     buf = io.BytesIO()
     prs.save(buf)
