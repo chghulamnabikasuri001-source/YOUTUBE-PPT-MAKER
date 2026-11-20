@@ -106,6 +106,7 @@ div[data-baseweb="popover"] li:hover { background:var(--soft) !important; }
 .stat b { display:block; font-size:1.7rem; color:#2F80ED; line-height:1.1; }
 .stat span { font-size:.82rem; color:#5B7A99; }
 .ok-title { font-size:1.25rem; font-weight:800; color:#12324F; margin:.2rem 0 0; }
+.site-footer { text-align:center; margin-top:2rem; font-size:.78rem; font-weight:500; letter-spacing:.04em; color:#94A3B8; opacity:.85; }
 </style>
 """
 
@@ -269,7 +270,8 @@ def main():
                        "select all the text and copy it here. Timestamps are supported.")
         c1, c2, c3 = st.columns(3)
         lang_label = c1.selectbox("Slide language", list(E.LANGS.keys()))
-        detail_label = c2.selectbox("Detail level", list(E.DETAIL.keys()), index=1)
+        detail_label = c2.selectbox("Detail level", list(E.DETAIL.keys()), index=1,
+                                    format_func=lambda k: E.DETAIL_HELP.get(k, k))
         theme_name = c3.selectbox("Theme", list(THEMES.keys()))
         st.markdown(swatches(theme_name), unsafe_allow_html=True)
         want_shots = st.checkbox(
@@ -328,6 +330,7 @@ def main():
             show_result(res)
 
     show_history()
+    st.markdown('<div class="site-footer">Created by CH GHULAM NABI</div>', unsafe_allow_html=True)
 
 
 main()
