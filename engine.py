@@ -19,11 +19,12 @@ except Exception:  # lets this module be imported where the SDK is missing (test
 
 DEFAULT_MODEL = "gemini-3.8-flash"
 FALLBACK_MODELS = ["gemini-3.6-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
-CHUNK_CHARS = 14000            # about 15 minutes of lecture per AI call
-MAX_TRANSCRIPT_CHARS = 150000
-SEGMENT_SECONDS = 600          # video mode: minutes of video per AI call
-MAX_VIDEO_SECONDS = 2 * 60 * 60
-MAX_SHOTS = 12                 # most screenshots we try to capture
+CHUNK_CHARS = 9000             # about 10 minutes of lecture per AI call (smaller = nothing is missed)
+MAX_TRANSCRIPT_CHARS = 450000  # about 8 hours of speech
+SEGMENT_SECONDS = 480          # video mode: 8 minutes of video per AI call
+MAX_VIDEO_SECONDS = 4 * 60 * 60
+MAX_SHOT_SECONDS = 2 * 60 * 60  # screenshots are skipped for videos longer than this
+MAX_SHOTS = 24                 # most screenshots we try to capture
 PARALLEL = 3                   # AI calls running at the same time
 
 LANGS = {
@@ -32,11 +33,26 @@ LANGS = {
     "Roman Urdu": "Roman Urdu (Urdu written in English letters)",
     "Same as the video": "the same language as the video",
 }
+# Slides scale with the length of the lecture: chars_per_slide (transcript) / per_minute (video)
 DETAIL = {
-    "Brief": "4-5",
-    "Standard": "6-8",
-    "Detailed": "9-12",
+    "Brief": dict(chars_per_slide=1700, per_minute=0.55),
+    "Standard": dict(chars_per_slide=1050, per_minute=0.9),
+    "Detailed": dict(chars_per_slide=620, per_minute=1.5),
 }
+DETAIL_HELP = {
+    "Brief": "Brief (about 1 slide per 2 min)",
+    "Standard": "Standard (about 1 slide per 1.2 min)",
+    "Detailed": "Detailed (about 1.5 slides per min)",
+}
+
+
+def slide_target(cfg, chars=None, seconds=None, minimum=1):
+    """How many slides one part of the lecture should get."""
+    if chars is not None:
+        n = round(chars / cfg["chars_per_slide"])
+    else:
+        n = round((seconds / 60.0) * cfg["per_minute"])
+    return int(min(14, max(minimum, n)))
 
 
 # ----------------------------------------------------------------------
@@ -336,7 +352,7 @@ Each slide is a JSON object:
 """
 
 
-def slide_system(lang, per_chunk, video_mode, first):
+def slide_system(lang, n_slides, video_mode, first):
     src = ("one segment of a lecture VIDEO (use what the teacher says AND what is shown on screen: text, formulas, diagrams, code)"
            if video_mode else "one part of a lecture TRANSCRIPT (auto-captions may contain spelling mistakes; fix them silently)")
     cover, tail = "", ""
@@ -349,7 +365,9 @@ Turn it into a visually rich, engaging classroom slide deck - like a polished ex
 
 {SCHEMA_HELP}
 Rules:
-- Make about {per_chunk} slides. Cover every important concept, definition, example, formula and step; put the fine detail in "notes".
+- Make exactly {n_slides} slides (at most {n_slides + 2} if this part truly has more distinct topics), in chronological order.
+- COMPLETE COVERAGE: do not skip ANY point. Every concept, definition, term, example, number, formula, step, comparison, warning and code line from this part must appear on a slide or inside that slide's "notes". Put the fine detail in "notes" (full sentences).
+- Size limits (the template overflows otherwise): bullets max 4; cards max 4; steps max 5; flow max 6; nested max 4; table max 4 columns and 6 rows; compare max 5 points per side; code max 12 lines; tree max 3 levels. If a topic has more, continue it on the next slide.
 - Slide text must be short and punchy. Never copy sentences from the transcript.
 - At least 70% of slides MUST have a visual. Pick the visual that fits the content best and vary them (never the same type 3 times in a row).
 - With table / cards / steps / tree / compare use NO bullets and use "footer" instead. With nested / flow / network / code use 2-3 bullets.
@@ -389,14 +407,14 @@ def _norm_part(d):
                 cover=d.get("cover") if isinstance(d.get("cover"), dict) else None)
 
 
-def slides_from_chunk(client, model, text, idx, total, lang, per_chunk):
-    system = slide_system(lang, per_chunk, False, idx == 1)
+def slides_from_chunk(client, model, text, idx, total, lang, n_slides):
+    system = slide_system(lang, n_slides, False, idx == 1)
     user = f"This is part {idx} of {total} of the lecture.\n\nTRANSCRIPT PART:\n{text}"
     return _norm_part(ask_json(client, model, system, user, max_tokens=9000))
 
 
-def slides_from_video(client, model, video_id, start, end, idx, total, lang, per_chunk):
-    system = slide_system(lang, per_chunk, True, idx == 1)
+def slides_from_video(client, model, video_id, start, end, idx, total, lang, n_slides):
+    system = slide_system(lang, n_slides, True, idx == 1)
     user = f"This is segment {idx} of {total} of the lecture (minutes {start // 60} to {end // 60})."
     media = types.Part(
         file_data=types.FileData(file_uri=f"https://www.youtube.com/watch?v={video_id}"),
@@ -453,7 +471,10 @@ def merge_parts(parts):
         if t.lower() not in seen:
             seen.add(t.lower())
             tk.append(t)
-    return dict(slides=slides, takeaways=_spread(tk, 6), quiz=_spread(quiz, 5), tagline=tagline, cover=cover)
+    tk_limit = min(24, max(6, -(-len(slides) // 8) * 2))
+    quiz_limit = min(25, max(5, -(-len(slides) // 6)))
+    return dict(slides=slides, takeaways=_spread(tk, tk_limit), quiz=_spread(quiz, quiz_limit),
+                tagline=tagline, cover=cover)
 
 
 # ----------------------------------------------------------------------
@@ -503,23 +524,25 @@ def grab_frames(video_id, times, proxy=None, workers=4):
 
 def keep_board_frames(client, model, frames):
     """Asks Gemini which frames show notes / board / slide text / code. Returns a set of frame keys."""
-    keys = sorted(frames)
-    if not keys:
-        return set()
-    contents = []
-    for n, k in enumerate(keys):
-        contents.append(types.Part.from_bytes(data=frames[k], mime_type="image/jpeg"))
-        contents.append(f"Image {n}")
-    contents.append("Which images should be kept?")
+    all_keys = sorted(frames)
+    kept = set()
     system = ("You review frames from a lecture video. KEEP an image only if its main content is written or typed "
               "notes, a whiteboard/blackboard, a presentation slide with text or formulas, code, or a diagram. "
               "DROP images that mainly show a person (teacher's face or body), a room, a title/intro screen, or are blurry. "
               'Return ONLY JSON: {"keep": [indexes of the images to keep]}')
-    try:
-        data = parse_json(ask_ai(client, model, system, contents, max_tokens=500))
-        return {keys[int(i)] for i in data.get("keep", []) if 0 <= int(i) < len(keys)}
-    except Exception:
-        return set()  # when unsure, add nothing
+    for start in range(0, len(all_keys), 10):  # 10 images per AI call keeps it fast and reliable
+        keys = all_keys[start:start + 10]
+        contents = []
+        for n, k in enumerate(keys):
+            contents.append(types.Part.from_bytes(data=frames[k], mime_type="image/jpeg"))
+            contents.append(f"Image {n}")
+        contents.append("Which images should be kept?")
+        try:
+            data = parse_json(ask_ai(client, model, system, contents, max_tokens=500))
+            kept |= {keys[int(i)] for i in data.get("keep", []) if 0 <= int(i) < len(keys)}
+        except Exception:
+            continue  # when unsure, add nothing from this batch
+    return kept
 
 
 def attach_screenshots(client, model, video_id, slides, proxy=None):
@@ -553,9 +576,14 @@ class UserError(Exception):
         self.msg, self.detail = msg, detail
 
 
-def _retry_failed(funcs, results, errors):
-    for i, e in enumerate(errors):
-        if e is not None:
+def _retry_failed(funcs, results, errors, rounds=3):
+    """Retries every failed part (up to 3 rounds) so no part of the lecture is skipped."""
+    for rnd in range(rounds):
+        failed = [i for i, e in enumerate(errors) if e is not None]
+        if not failed:
+            return
+        time.sleep(4 * (rnd + 1))
+        for i in failed:
             try:
                 results[i] = funcs[i]()
                 errors[i] = None
@@ -574,7 +602,7 @@ def generate_presentation(url, manual_text, lang_label, detail_label, theme_name
     vid = extract_video_id(url)
     if not vid:
         raise UserError("This does not look like a valid YouTube link. Please check it and try again.")
-    lang, rtl, per = LANGS[lang_label], lang_label.startswith("Urdu"), DETAIL[detail_label]
+    lang, rtl, cfg = LANGS[lang_label], lang_label.startswith("Urdu"), DETAIL[detail_label]
 
     say("🔎 Reading the video details")
     prog(0.04, "Reading the video details...")
@@ -605,10 +633,12 @@ def generate_presentation(url, manual_text, lang_label, detail_label, theme_name
             raise UserError("The transcript is too short to create a presentation.")
         chunks, truncated = split_chunks(snips)
         if truncated:
-            warn("This video is very long, so only the first part is used.")
+            warn("This transcript is extremely long, so only the first part is used.")
         video_end = chunks[-1]["end"]
         say(f"🎨 Designing slides ({len(chunks)} part{'s' if len(chunks) > 1 else ''} at the same time)")
-        funcs = [(lambda ch=ch, i=i: slides_from_chunk(client, model, ch["text"], i, len(chunks), lang, per))
+        funcs = [(lambda ch=ch, i=i: slides_from_chunk(
+                     client, model, ch["text"], i, len(chunks), lang,
+                     slide_target(cfg, chars=len(ch["text"]), minimum=3 if len(chunks) == 1 else 1)))
                  for i, ch in enumerate(chunks, 1)]
         results, errors = run_parallel(
             funcs, on_progress=lambda d, n: prog(0.1 + 0.6 * d / n, f"Designing slides... {d} of {n} parts done"))
@@ -623,11 +653,13 @@ def generate_presentation(url, manual_text, lang_label, detail_label, theme_name
         duration = get_video_duration(vid, proxy)
         limit = min(duration, MAX_VIDEO_SECONDS) if duration else MAX_VIDEO_SECONDS
         if duration and duration > MAX_VIDEO_SECONDS:
-            warn("This video is longer than 2 hours, so only the first 2 hours are used.")
+            warn("This video is longer than 4 hours, so only the first 4 hours are used.")
         starts = list(range(0, int(limit), SEGMENT_SECONDS))
         spans = [(s0, min(s0 + SEGMENT_SECONDS, int(limit))) for s0 in starts]
         if duration:
-            funcs = [(lambda k=k, sp=sp: slides_from_video(client, model, vid, sp[0], sp[1], k, len(spans), lang, per))
+            funcs = [(lambda k=k, sp=sp: slides_from_video(
+                         client, model, vid, sp[0], sp[1], k, len(spans), lang,
+                         slide_target(cfg, seconds=sp[1] - sp[0], minimum=2)))
                      for k, sp in enumerate(spans, 1)]
             results, errors = run_parallel(
                 funcs, on_progress=lambda d, n: prog(0.1 + 0.6 * d / n, f"Watching the video... {d} of {n} parts done"))
@@ -641,7 +673,8 @@ def generate_presentation(url, manual_text, lang_label, detail_label, theme_name
             for k, (a, b) in enumerate(spans, 1):
                 prog(min(0.1 + 0.05 * k, 0.7), f"Watching the video... part {k}")
                 try:
-                    part = slides_from_video(client, model, vid, a, b, k, len(spans), lang, per)
+                    part = slides_from_video(client, model, vid, a, b, k, len(spans), lang,
+                                             slide_target(cfg, seconds=b - a, minimum=2))
                 except Exception:
                     if parts:
                         break  # probably past the end of the video
@@ -657,7 +690,7 @@ def generate_presentation(url, manual_text, lang_label, detail_label, theme_name
 
     shots = 0
     if want_shots:
-        if video_end > MAX_VIDEO_SECONDS:
+        if video_end > MAX_SHOT_SECONDS:
             notes.append("The video is longer than 2 hours, so screenshots were skipped.")
         else:
             say("📸 Looking for notes and code on screen")
